@@ -1,0 +1,408 @@
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <string.h>
+
+#define DIGIT_TO_VAL(_x)        (_x - '0')
+
+    enum _sentence_types {      //there are some more than 10 fields in some sentences , thus we have to increase these value.
+        _GPS_SENTENCE_GPRMC = 32,
+        _GPS_SENTENCE_GPGGA = 64,
+        _GPS_SENTENCE_GPVTG = 96,
+        _GPS_SENTENCE_OTHER = 0
+    };
+
+    /// Update the decode state machine with a new character
+    ///
+    /// @param	c		The next character in the NMEA input stream
+    /// @returns		True if processing the character has resulted in
+    ///					an update to the GPS state
+    ///
+    bool                        _decode(char c);
+
+    /// Return the numeric value of an ascii hex character
+    ///
+    /// @param	a		The character to be converted
+    /// @returns		The value of the character as a hex digit
+    ///
+    int16_t                     _from_hex(char a);
+
+    /// Parses the current term as a NMEA-style decimal number with
+    /// up to two decimal digits.
+    ///
+    /// @returns		The value expressed by the string in _term,
+    ///					multiplied by 100.
+    ///
+    uint32_t    _parse_decimal_100();
+
+    /// Parses the current term as a NMEA-style degrees + minutes
+    /// value with up to four decimal digits.
+    ///
+    /// This gives a theoretical resolution limit of around 1cm.
+    ///
+    /// @returns		The value expressed by the string in _term,
+    ///					multiplied by 1e7.
+    ///
+    uint32_t    _parse_degrees();
+
+    /// Processes the current term when it has been deemed to be
+    /// complete.
+    ///
+    /// Each GPS message is broken up into terms separated by commas.
+    /// Each term is then processed by this function as it is received.
+    ///
+    /// @returns		True if completing the term has resulted in
+    ///					an update to the GPS state.
+    bool                        _term_complete();
+
+    uint8_t _parity;                                                    ///< NMEA message checksum accumulator
+    bool _is_checksum_term;                                     ///< current term is the checksum
+    char _term[15];                                                     ///< buffer for the current term within the current sentence
+    uint8_t _sentence_type;                                     ///< the sentence type currently being processed
+    uint8_t _term_number;                                       ///< term index within the current sentence
+    uint8_t _term_offset;                                       ///< character offset with the term being received
+    bool _gps_data_good;                                        ///< set when the sentence indicates data is good
+
+    // The result of parsing terms within a message is stored temporarily until
+    // the message is completely processed and the checksum validated.
+    // This avoids the need to buffer the entire message.
+    int32_t _new_time;                                                  ///< time parsed from a term
+    int32_t _new_date;                                                  ///< date parsed from a term
+    int32_t _new_latitude;                                      ///< latitude parsed from a term
+    int32_t _new_longitude;                                     ///< longitude parsed from a term
+    int32_t _new_altitude;                                      ///< altitude parsed from a term
+    int32_t _new_speed;                                                 ///< speed parsed from a term
+    int32_t _new_course;                                        ///< course parsed from a term
+    int16_t _new_hdop;                                                  ///< HDOP parsed from a term
+    uint8_t _new_satellite_count;                       ///< satellite count parsed from a term
+    uint8_t _new_fix;
+
+    enum GPS_Status {
+        NO_GPS = 0,             ///< No GPS connected/detected
+        NO_FIX = 1,             ///< Receiving valid GPS messages but no lock
+        GPS_OK_FIX_2D = 2,      ///< Receiving valid messages and 2D lock
+        GPS_OK_FIX_3D = 3,      ///< Receiving valid messages and 3D lock
+        GPS_OK_FIX_RTK = 4
+    };
+
+    /// Fix status codes
+    ///
+    enum Fix_Status {
+        FIX_NONE = 0,           ///< No fix
+        FIX_2D = 2,             ///< 2d fix
+        FIX_3D = 3,             ///< 3d fix
+        FIX_RTK = 5,
+    };
+
+    // GPS navigation engine settings. Not all GPS receivers support
+    // this
+    enum GPS_Engine_Setting {
+        GPS_ENGINE_NONE        = -1,
+        GPS_ENGINE_PORTABLE    = 0,
+        GPS_ENGINE_STATIONARY  = 2,
+        GPS_ENGINE_PEDESTRIAN  = 3,
+        GPS_ENGINE_AUTOMOTIVE  = 4,
+        GPS_ENGINE_SEA         = 5,
+        GPS_ENGINE_AIRBORNE_1G = 6,
+        GPS_ENGINE_AIRBORNE_2G = 7,
+        GPS_ENGINE_AIRBORNE_4G = 8
+    };
+
+    // Properties
+    uint32_t time_week_ms;              ///< GPS time (milliseconds from start of GPS week)
+    uint16_t time_week;                 ///< GPS week number
+    int32_t latitude;                   ///< latitude in degrees * 10,000,000
+    int32_t longitude;                  ///< longitude in degrees * 10,000,000
+    int32_t altitude_cm;                ///< altitude in cm
+    uint32_t ground_speed_cm;           ///< ground speed in cm/sec
+    int32_t ground_course_cd;           ///< ground course in 100ths of a degree
+    int32_t speed_3d_cm;                ///< 3D speed in cm/sec (not always available)
+    int16_t hdop;                       ///< horizontal dilution of precision in cm
+    uint8_t num_sats;           ///< Number of visible satelites
+    uint8_t fix;
+
+    /// Set to true when new data arrives.  A client may set this
+    /// to false in order to avoid processing data they have
+    /// already seen.
+    bool new_data;
+
+    uint16_t _last_gps_time;
+
+const char _gprmc_string[] = "GPRMC";
+const char _gpgga_string[] = "GPGGA";
+const char _gpvtg_string[] = "GPVTG";
+
+bool _decode(char c)
+{
+    bool valid_sentence = false;
+
+    switch (c) {
+    case ',': // term terminators
+        _parity ^= c;
+    case '\r':
+    case '\n':
+    case '*':
+        if (_term_offset < sizeof(_term)) {
+            _term[_term_offset] = 0;
+            valid_sentence = _term_complete();
+        }
+        ++_term_number;
+        _term_offset = 0;
+        _is_checksum_term = c == '*';
+        return valid_sentence;
+
+    case '$': // sentence begin
+        _term_number = _term_offset = 0;
+        _parity = 0;
+        _sentence_type = _GPS_SENTENCE_OTHER;
+        _is_checksum_term = false;
+        _gps_data_good = false;
+        return valid_sentence;
+    }
+
+    // ordinary characters
+    if (_term_offset < sizeof(_term) - 1)
+        _term[_term_offset++] = c;
+    if (!_is_checksum_term)
+        _parity ^= c;
+
+    return valid_sentence;
+}
+
+//
+// internal utilities
+//
+int16_t _from_hex(char a)
+{
+    if (a >= 'A' && a <= 'F')
+        return a - 'A' + 10;
+    else if (a >= 'a' && a <= 'f')
+        return a - 'a' + 10;
+    else
+        return a - '0';
+}
+
+uint32_t _parse_decimal_100()
+{
+    char *p = _term;
+    uint32_t ret = 100UL * atol(p);
+    while (isdigit(*p))
+        ++p;
+    if (*p == '.') {
+        if (isdigit(p[1])) {
+            ret += 10 * (p[1] - '0');
+            if (isdigit(p[2]))
+                ret += p[2] - '0';
+        }
+    }
+    return ret;
+}
+
+/*
+  parse a NMEA latitude/longitude degree value. The result is in degrees*1e7
+ */
+uint32_t _parse_degrees()
+{
+    char *p, *q;
+    uint8_t deg = 0, min = 0;
+    float frac_min = 0;
+    int32_t ret = 0;
+
+    // scan for decimal point or end of field
+    for (p = _term; isdigit(*p); p++)
+        ;
+    q = _term;
+
+    // convert degrees
+    while ((p - q) > 2) {
+        if (deg)
+            deg *= 10;
+        deg += DIGIT_TO_VAL(*q++);
+    }
+
+    // convert minutes
+    while (p > q) {
+        if (min)
+            min *= 10;
+        min += DIGIT_TO_VAL(*q++);
+    }
+
+    // convert fractional minutes
+    if (*p == '.') {
+        q = p + 1;
+        float frac_scale = 0.1f;
+        while (isdigit(*q)) {
+            frac_min += (*q++ - '0') * frac_scale;
+            frac_scale *= 0.1f;
+        }
+    }
+    ret = (deg * (int32_t)10000000UL);
+    ret += (min * (int32_t)10000000UL / 60);
+    ret += (int32_t) (frac_min * (1.0e7 / 60.0f));
+    return ret;
+}
+
+// Processes a just-completed term
+// Returns true if new sentence has just passed checksum test and is validated
+bool _term_complete()
+{
+    // handle the last term in a message
+    if (_is_checksum_term) {
+        uint8_t checksum = 16 * _from_hex(_term[0]) + _from_hex(_term[1]);
+        if (1) { //checksum == _parity) {
+            if (_gps_data_good) {
+                switch (_sentence_type) {
+                case _GPS_SENTENCE_GPRMC:
+                    //time                        = _new_time;
+                    //date                        = _new_date;
+                    //latitude            = _new_latitude;
+                    //longitude           = _new_longitude;
+                    //ground_speed_cm     = _new_speed;
+                    //ground_course_cd    = _new_course;
+                    //_make_gps_time(_new_date, _new_time * 10);
+                    _last_gps_time      = _new_time;//hal.scheduler->millis();
+                    //fix                 = GPS::FIX_3D;          // To-Do: add support for proper reporting of 2D and 3D fix
+                    break;
+                case _GPS_SENTENCE_GPGGA:
+                    altitude_cm         = _new_altitude;
+                    //time                        = _new_time;
+                    latitude            = _new_latitude;
+                    longitude           = _new_longitude;
+                    num_sats            = _new_satellite_count;
+                    hdop                        = _new_hdop;
+
+                    if(_new_fix > 2)
+                        fix = FIX_RTK;
+                    else
+                        fix = FIX_3D;
+                    break;
+                case _GPS_SENTENCE_GPVTG:
+                    ground_speed_cm     = _new_speed;
+                    ground_course_cd    = _new_course;
+                    // VTG has no fix indicator, can't change fix status
+                    break;
+                }
+            } else {
+                switch (_sentence_type) {
+                //case _GPS_SENTENCE_GPRMC:
+                case _GPS_SENTENCE_GPGGA:
+                    // Only these sentences give us information about
+                    // fix status.
+                    fix = FIX_NONE;
+                }
+            }
+            // we got a good message
+            //printf("Good message\n");
+            return true;
+        }
+        // we got a bad message, ignore it
+        printf("Checksum fail %d %d %c %c\n", _parity, checksum, _term[0], _term[1]);
+        return false;
+    }
+
+    // the first term determines the sentence type
+    if (_term_number == 0) {
+        if (!strcmp(_term, _gprmc_string)) {
+            _sentence_type = _GPS_SENTENCE_GPRMC;
+        } else if (!strcmp(_term, _gpgga_string)) {
+            _sentence_type = _GPS_SENTENCE_GPGGA;
+        } else if (!strcmp(_term, _gpvtg_string)) {
+            _sentence_type = _GPS_SENTENCE_GPVTG;
+            // VTG may not contain a data qualifier, presume the solution is good
+            // unless it tells us otherwise.
+            _gps_data_good = true;
+        } else {
+            _sentence_type = _GPS_SENTENCE_OTHER;
+        }
+        return false;
+    }
+
+    // 32 = RMC, 64 = GGA, 96 = VTG
+    if (_sentence_type != _GPS_SENTENCE_OTHER && _term[0]) {
+        switch (_sentence_type + _term_number) {
+        // operational status
+        //
+        case _GPS_SENTENCE_GPRMC + 2: // validity (RMC)
+            _gps_data_good = _term[0] == 'A';
+            break;
+        case _GPS_SENTENCE_GPGGA + 6: // Fix data (GGA)
+            //_gps_data_good = _term[0] > '0';
+            // BN: Hack: Only accept DGPS or RTK fixes
+            _gps_data_good = _term[0] > '0';
+            _new_fix = _term[0] - '0';
+            break;
+        case _GPS_SENTENCE_GPVTG + 9: // validity (VTG) (we may not see this field)
+            _gps_data_good = _term[0] != 'N';
+            break;
+        case _GPS_SENTENCE_GPGGA + 7: // satellite count (GGA)
+            _new_satellite_count = atol(_term);
+            break;
+        case _GPS_SENTENCE_GPGGA + 8: // HDOP (GGA)
+            _new_hdop = _parse_decimal_100();
+            break;
+
+        // time and date
+        //
+        case _GPS_SENTENCE_GPRMC + 1: // Time (RMC)
+        case _GPS_SENTENCE_GPGGA + 1: // Time (GGA)
+            _new_time = _parse_decimal_100();
+            break;
+        case _GPS_SENTENCE_GPRMC + 9: // Date (GPRMC)
+            _new_date = atol(_term);
+            break;
+
+        // location
+        //
+        case _GPS_SENTENCE_GPRMC + 3: // Latitude
+        case _GPS_SENTENCE_GPGGA + 2:
+            _new_latitude = _parse_degrees();
+            break;
+        case _GPS_SENTENCE_GPRMC + 4: // N/S
+        case _GPS_SENTENCE_GPGGA + 3:
+            if (_term[0] == 'S')
+                _new_latitude = -_new_latitude;
+            break;
+        case _GPS_SENTENCE_GPRMC + 5: // Longitude
+        case _GPS_SENTENCE_GPGGA + 4:
+            _new_longitude = _parse_degrees();
+            break;
+        case _GPS_SENTENCE_GPRMC + 6: // E/W
+        case _GPS_SENTENCE_GPGGA + 5:
+            if (_term[0] == 'W')
+                _new_longitude = -_new_longitude;
+            break;
+        case _GPS_SENTENCE_GPGGA + 9: // Altitude (GPGGA)
+            _new_altitude = _parse_decimal_100();
+            break;
+
+        // course and speed
+        //
+        case _GPS_SENTENCE_GPRMC + 7: // Speed (GPRMC)
+        case _GPS_SENTENCE_GPVTG + 5: // Speed (VTG)
+            _new_speed = (_parse_decimal_100() * 514) / 1000;       // knots-> m/sec, approximiates * 0.514
+            break;
+        case _GPS_SENTENCE_GPRMC + 8: // Course (GPRMC)
+        case _GPS_SENTENCE_GPVTG + 1: // Course (VTG)
+            _new_course = _parse_decimal_100();
+            break;
+        }
+    }
+
+    return false;
+}
+
+
+int main(int argc, char** argv)
+{
+    int c;
+    while((c = getchar()) != EOF) {
+        if(_decode((uint8_t)c))
+            printf("%f %f %f\n", latitude / 1e7, longitude / 1e7, altitude_cm / 100.);
+    }
+    return 0;
+}
+
+
